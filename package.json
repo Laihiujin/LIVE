@@ -1,7 +1,7 @@
 {
   "name": "LIVE",
   "private": true,
-  "version": "3.19.11",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
