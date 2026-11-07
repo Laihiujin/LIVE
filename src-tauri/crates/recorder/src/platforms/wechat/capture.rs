@@ -71,6 +71,24 @@ pub struct CaptureStatus {
     pub hosts: Vec<String>,
     /// JSON endpoints seen during this capture, to diagnose a missing room name.
     pub json_endpoints: Vec<String>,
+    /// `system_proxy` or `rules` while capturing.
+    pub mode: Option<CaptureMode>,
+    /// Port the user's tool forwards to in rule mode.
+    pub rules_port: u16,
+    /// A tunnel (TUN mode, VPN) owns the default route, so only rule mode can work.
+    pub tunnel_interface: Option<String>,
+    /// Physical interface upstream connections are pinned to while capturing around a tunnel.
+    pub bypass_interface: Option<String>,
+}
+
+/// How WeChat's traffic reaches the capture proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// LIVE takes over the system proxy for the duration of the capture.
+    SystemProxy,
+    /// The user's proxy tool forwards Tencent hosts to a fixed port; the system proxy is untouched.
+    Rules,
 }
 
 fn host_matches(host: &str, suffixes: &[String]) -> bool {
@@ -343,14 +361,54 @@ async fn inspect_json(shared: &Shared, endpoint: String, res: Response<Body>) ->
 struct CaptureHandler {
     shared: Arc<Shared>,
     pending: Option<(String, String)>,
+    /// Upstream connections go around a tunnel. WebSocket upgrades would not (the library opens
+    /// those itself), so they are refused rather than looped back through the user's tool.
+    bypassing: bool,
+}
+
+/// Decrypted requests carry an explicit `:443`; drop it so URLs read as WeChat requested them.
+fn without_default_port(url: &str) -> String {
+    for (scheme, port) in [("https://", ":443"), ("http://", ":80")] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            let end = rest.find(['/', '?']).unwrap_or(rest.len());
+            if let Some(host) = rest[..end].strip_suffix(port) {
+                return format!("{scheme}{host}{}", &rest[end..]);
+            }
+        }
+    }
+    url.to_string()
+}
+
+fn status_response(status: u16) -> RequestOrResponse {
+    Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .expect("static response")
+        .into()
 }
 
 impl HttpHandler for CaptureHandler {
     async fn handle_request(&mut self, _ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
         self.pending = None;
+        let tencent = req
+            .uri()
+            .host()
+            .is_some_and(|host| host_matches(host, &self.shared.suffixes));
+        // A proxy tool testing this server: answering here makes its fallback depend only on
+        // whether LIVE is capturing.
+        if !tencent && req.method() == hudsucker::hyper::Method::GET && req.uri().path().ends_with("/generate_204") {
+            return status_response(204);
+        }
+        let websocket = req
+            .headers()
+            .get(hudsucker::hyper::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+        if self.bypassing && websocket {
+            return status_response(502);
+        }
         if let Some(host) = req.uri().host().map(str::to_string) {
             if host_matches(&host, &self.shared.suffixes) {
-                let url = req.uri().to_string();
+                let url = without_default_port(&req.uri().to_string());
                 if let Some(kind) = kind_from_path(req.uri().path()) {
                     self.shared.note_stream(&url, &host, kind);
                 }
@@ -1113,19 +1171,6 @@ impl ProxyStore for SystemProxyStore {
     }
 }
 
-/// The network interface of the default route, e.g. `en0` or a VPN's `utun3`.
-#[cfg(target_os = "macos")]
-fn default_route_interface() -> Option<String> {
-    let output = std::process::Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("interface:"))
-        .map(|name| name.trim().to_string())
-}
-
 /// Waits for the takeover to become the proxy apps actually use. Tools that route traffic through
 /// a virtual interface (Quantumult X, Surge, Clash in enhanced/TUN mode, or any VPN) become the
 /// primary service, and its proxy settings win; capturing would then silently find nothing.
@@ -1142,13 +1187,10 @@ fn wait_until_proxy_effective(ours: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let interface = default_route_interface().unwrap_or_default();
-    let virtual_interface = ["utun", "ipsec", "ppp", "tun", "tap"]
-        .iter()
-        .any(|prefix| interface.starts_with(prefix));
-    Err(if virtual_interface {
+    let interface = super::bypass::default_route_interface().unwrap_or_default();
+    Err(if super::bypass::is_virtual_interface(&interface) {
         format!(
-            "系统代理没有生效：网络当前由虚拟网卡 {interface} 接管，多半是 Quantumult X、Surge、Clash 等工具的增强模式（TUN）或 VPN。请先关闭增强模式或断开 VPN 再开始抓取，原代理设置已恢复。"
+            "系统代理没有生效：网络当前由虚拟网卡 {interface} 接管（Quantumult X、Shadowrocket、Clash 的增强模式 / TUN 或 VPN）。请改用“分流规则”方式抓取，不用关闭它们。原代理设置已恢复。"
         )
     } else {
         "系统代理没有生效，可能被其他工具锁定，原代理设置已恢复。可以在“系统设置 → 网络 → 详细信息 → 代理”里检查。".to_string()
@@ -1199,6 +1241,8 @@ struct Running {
     started: std::time::Instant,
     replaced_existing_proxy: bool,
     watchdog: JoinHandle<()>,
+    mode: CaptureMode,
+    bypass_interface: Option<String>,
 }
 
 pub struct WechatCapture {
@@ -1241,9 +1285,18 @@ impl WechatCapture {
             .await
             .map_err(|e| e.to_string())?
             .unwrap_or(false);
+        let tunnel_interface = tokio::task::spawn_blocking(super::bypass::default_route_interface)
+            .await
+            .ok()
+            .flatten()
+            .filter(|name| super::bypass::is_virtual_interface(name));
         let running = self.running.lock().await;
         let findings = self.shared.findings.lock().unwrap();
         Ok(CaptureStatus {
+            mode: running.as_ref().map(|item| item.mode),
+            rules_port: super::bypass::RULES_PORT,
+            tunnel_interface,
+            bypass_interface: running.as_ref().and_then(|item| item.bypass_interface.clone()),
             supported: cfg!(any(windows, target_os = "macos")),
             ca_installed,
             running: running.is_some(),
@@ -1376,8 +1429,14 @@ impl WechatCapture {
         }
     }
 
+    /// Captures through the system proxy, as the account monitor expects.
     #[cfg(any(windows, target_os = "macos"))]
     pub async fn start(self: &Arc<Self>) -> Result<(), String> {
+        self.start_with(CaptureMode::SystemProxy).await
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub async fn start_with(self: &Arc<Self>, mode: CaptureMode) -> Result<(), String> {
         let mut running = self.running.lock().await;
         if running.is_some() {
             return Ok(());
@@ -1386,9 +1445,32 @@ impl WechatCapture {
         if !is_trusted(&self.dir, &ca.serial_hex) {
             return Err("请先安装抓取证书".into());
         }
-        let listener = TcpListener::bind(("127.0.0.1", 0))
+        let bind_port = match mode {
+            CaptureMode::SystemProxy => 0,
+            CaptureMode::Rules => super::bypass::RULES_PORT,
+        };
+        let listener = TcpListener::bind(("127.0.0.1", bind_port))
             .await
-            .map_err(|e| format!("无法启动本地代理：{e}"))?;
+            .map_err(|e| match mode {
+                CaptureMode::Rules => format!(
+                    "端口 {bind_port} 被占用，无法启动分流抓取：{e}"
+                ),
+                CaptureMode::SystemProxy => format!("无法启动本地代理：{e}"),
+            })?;
+        let bypass = tokio::task::spawn_blocking(super::bypass::detect)
+            .await
+            .map_err(|e| e.to_string())?;
+        if mode == CaptureMode::Rules && bypass.is_none() {
+            if let Some(tunnel) = tokio::task::spawn_blocking(super::bypass::default_route_interface)
+                .await
+                .ok()
+                .flatten()
+                .filter(|name| super::bypass::is_virtual_interface(name))
+            {
+                return Err(format!("网络由虚拟网卡 {tunnel} 接管，但找不到可用的物理网卡（Wi-Fi 或有线），无法绕开它"));
+            }
+        }
+        let bypass_interface = bypass.as_ref().map(|item| item.interface.clone());
         let port = listener
             .local_addr()
             .map_err(|e| format!("无法启动本地代理：{e}"))?
@@ -1400,10 +1482,11 @@ impl WechatCapture {
             Proxy::builder()
                 .with_listener(listener)
                 .with_ca(authority)
-                .with_rustls_connector(hudsucker::rustls::crypto::ring::default_provider())
+                .with_http_connector(super::bypass::connector(bypass)?)
                 .with_http_handler(CaptureHandler {
                     shared: self.shared.clone(),
                     pending: None,
+                    bypassing: bypass_interface.is_some(),
                 })
                 .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
@@ -1411,18 +1494,24 @@ impl WechatCapture {
                 .build()
                 .map_err(|e| format!("无法启动本地代理：{e}"))?,
         );
-        // `networksetup` runs one process per call and per network service, so keep it off the
-        // async workers.
-        let dir = self.dir.clone();
-        let takeover = tokio::task::spawn_blocking(move || take_over_and_confirm(&dir, port))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|result| result);
-        let previous = match takeover {
-            Ok(previous) => previous,
-            Err(error) => {
-                let _ = shutdown.send(());
-                return Err(error);
+        let replaced_existing_proxy = match mode {
+            CaptureMode::Rules => false,
+            CaptureMode::SystemProxy => {
+                // `networksetup` runs one process per call and per network service, so keep it
+                // off the async workers.
+                let dir = self.dir.clone();
+                let takeover =
+                    tokio::task::spawn_blocking(move || take_over_and_confirm(&dir, port))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| result);
+                match takeover {
+                    Ok(previous) => previous.enabled(),
+                    Err(error) => {
+                        let _ = shutdown.send(());
+                        return Err(error);
+                    }
+                }
             }
         };
         let namer_shared = self.shared.clone();
@@ -1454,8 +1543,10 @@ impl WechatCapture {
             port,
             shutdown,
             started: std::time::Instant::now(),
-            replaced_existing_proxy: previous.enabled(),
+            replaced_existing_proxy,
             watchdog,
+            mode,
+            bypass_interface,
         });
         Ok(())
     }
@@ -1475,13 +1566,25 @@ impl WechatCapture {
         Err(WINDOWS_ONLY.into())
     }
 
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub async fn start_with(self: &Arc<Self>, _mode: CaptureMode) -> Result<(), String> {
+        Err(WINDOWS_ONLY.into())
+    }
+
+    /// Rules for Quantumult X, Shadowrocket and Clash that forward the capture domains to LIVE.
+    pub fn rule_snippets(&self) -> super::bypass::RuleSnippets {
+        super::bypass::rule_snippets(MITM_SUFFIXES)
+    }
+
     pub async fn stop(&self) -> Result<(), String> {
         let Some(running) = self.running.lock().await.take() else {
             return Ok(());
         };
         // Restore first: a stopped proxy with the setting still in place would cut off the network.
         #[cfg(any(windows, target_os = "macos"))]
-        let restored = {
+        let restored = if running.mode == CaptureMode::Rules {
+            Ok(())
+        } else {
             let dir = self.dir.clone();
             tokio::task::spawn_blocking(move || restore_proxy(&SystemProxyStore, &dir))
                 .await
@@ -1565,6 +1668,14 @@ mod tests {
         for host in ["qq.com.evil.test", "notqq.com", "bank.example.com", "weixin.com"] {
             assert!(!host_matches(host, &suffixes), "{host}");
         }
+    }
+
+    #[test]
+    fn default_ports_are_dropped_from_captured_urls() {
+        assert_eq!(without_default_port("https://a.qq.com:443/l.flv?x=1"), "https://a.qq.com/l.flv?x=1");
+        assert_eq!(without_default_port("http://a.qq.com:80/x"), "http://a.qq.com/x");
+        assert_eq!(without_default_port("https://localhost:8443/x"), "https://localhost:8443/x");
+        assert_eq!(without_default_port("https://a.qq.com:443"), "https://a.qq.com");
     }
 
     #[test]
@@ -1981,6 +2092,7 @@ mod tests {
                 .with_http_handler(CaptureHandler {
                     shared: shared.clone(),
                     pending: None,
+                    bypassing: false,
                 })
                 .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
@@ -1995,6 +2107,53 @@ mod tests {
             ca,
             _shutdown: shutdown,
         }
+    }
+
+    /// What the user's tool does in rule mode: send Tencent requests to the proxy while the TUN owns
+    /// the route. Checks the health check is answered locally and Tencent is reached without
+    /// looping back through the tunnel.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "Needs a TUN tool running and network access"]
+    async fn rule_mode_reaches_tencent_around_the_tunnel() {
+        install_crypto_provider();
+        let bypass = super::super::bypass::detect().expect("no TUN owns the default route");
+        let suffixes: Vec<String> = MITM_SUFFIXES.iter().map(|s| s.to_string()).collect();
+        let ca = load_or_create_ca(&temp_dir(), &suffixes).unwrap();
+        let shared = Shared::new(suffixes);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let (_shutdown, shutdown_rx) = oneshot::channel::<()>();
+        spawn_proxy(
+            Proxy::builder()
+                .with_listener(listener)
+                .with_ca(authority(&ca).unwrap())
+                .with_http_connector(super::super::bypass::connector(Some(bypass)).unwrap())
+                .with_http_handler(CaptureHandler {
+                    shared: shared.clone(),
+                    pending: None,
+                    bypassing: true,
+                })
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .build()
+                .unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(ca.cert_pem.as_bytes()).unwrap())
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let check = client.get(super::super::bypass::CHECK_URL).send().await.unwrap();
+        assert_eq!(check.status(), 204);
+        let url = "https://finder.video.qq.com/251/20302/stodownload/live_123456789.flv?x=1";
+        let response = client.get(url).send().await.unwrap();
+        println!("tencent status {}", response.status());
+        let urls: Vec<String> = shared.findings.lock().unwrap().candidates.iter().map(|c| c.url.clone()).collect();
+        println!("captured {urls:?}");
+        assert!(urls.iter().any(|u| *u == url), "{urls:?}");
     }
 
     #[tokio::test]

@@ -19,6 +19,51 @@
     candidates: Candidate[];
     hosts: string[];
     json_endpoints: string[];
+    mode: "system_proxy" | "rules" | null;
+    rules_port: number;
+    tunnel_interface: string | null;
+    bypass_interface: string | null;
+  }
+  interface RuleSnippets {
+    port: number;
+    quantumult_x: string;
+    shadowrocket: string;
+    clash: string;
+  }
+  type CaptureMode = "system_proxy" | "rules";
+  const TOOLS: { key: keyof Omit<RuleSnippets, "port">; label: string }[] = [
+    { key: "quantumult_x", label: "Quantumult X" },
+    { key: "shadowrocket", label: "Shadowrocket" },
+    { key: "clash", label: "Clash / Mihomo" },
+  ];
+  // Rule mode is the only one that works while a TUN tool owns the network; remember the choice.
+  let captureMode: CaptureMode = (localStorage.getItem("wechatCaptureMode") as CaptureMode) || "system_proxy";
+  let modeChosen = !!localStorage.getItem("wechatCaptureMode");
+  let rules: RuleSnippets | null = null;
+  let ruleTool: keyof Omit<RuleSnippets, "port"> = "quantumult_x";
+  let copied = "";
+  $: if (status?.tunnel_interface && !modeChosen) captureMode = "rules";
+  $: if (captureMode === "rules" && !rules) loadRules();
+
+  function chooseMode(mode: CaptureMode) {
+    captureMode = mode;
+    modeChosen = true;
+    localStorage.setItem("wechatCaptureMode", mode);
+  }
+
+  async function loadRules() {
+    try {
+      rules = (await invoke("wechat_capture_rules")) as RuleSnippets;
+    } catch (e) {
+      rules = null;
+    }
+  }
+
+  async function copyRules() {
+    if (!rules) return;
+    await navigator.clipboard.writeText(rules[ruleTool]);
+    copied = ruleTool;
+    setTimeout(() => (copied = ""), 1500);
   }
 
   /** Adds the captured stream to the room list. Throws with a message when that fails. */
@@ -159,11 +204,11 @@
     }
   }
 
-  async function run(command: string) {
+  async function run(command: string, args?: Record<string, unknown>) {
     busy = true;
     error = "";
     try {
-      await invoke(command);
+      await invoke(command, args);
     } catch (e) {
       error = String(e);
     }
@@ -286,7 +331,37 @@
       <button class="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white disabled:opacity-50" disabled={busy}
         on:click={() => run("wechat_capture_install_ca")}>安装证书</button>
     {:else if !status.running}
-      <p class="text-xs">开始后会临时接管系统代理，停止或退出软件时自动恢复。最长运行 10 分钟。</p>
+      <div class="flex gap-1 text-xs">
+        <button class="px-2 py-1 rounded-md {captureMode === 'system_proxy' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700'}"
+          on:click={() => chooseMode("system_proxy")}>系统代理</button>
+        <button class="px-2 py-1 rounded-md {captureMode === 'rules' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700'}"
+          on:click={() => chooseMode("rules")}>分流规则（TUN / 增强模式）</button>
+      </div>
+      {#if captureMode === "system_proxy"}
+        <p class="text-xs">开始后会临时接管系统代理，停止或退出软件时自动恢复。最长运行 10 分钟。</p>
+        {#if status.tunnel_interface}
+          <p class="text-xs text-amber-600 dark:text-amber-400">
+            网络当前由虚拟网卡 {status.tunnel_interface} 接管（Quantumult X、Shadowrocket、Clash 的 TUN / 增强模式或 VPN），系统代理不会生效，请改用“分流规则”。
+          </p>
+        {/if}
+      {:else}
+        <p class="text-xs">
+          不改系统代理，代理工具保持开启。在你的代理工具里加入下面的规则（只需一次）：腾讯相关域名会转给 LIVE 的 127.0.0.1:{status.rules_port}；LIVE 没在抓取时自动直连，平时不影响微信。
+        </p>
+        {#if rules}
+          <div class="flex gap-1 text-xs">
+            {#each TOOLS as tool}
+              <button class="px-2 py-0.5 rounded {ruleTool === tool.key ? 'bg-gray-700 text-white dark:bg-gray-200 dark:text-black' : 'bg-gray-200 dark:bg-gray-700'}"
+                on:click={() => (ruleTool = tool.key)}>{tool.label}</button>
+            {/each}
+            <button class="ml-auto px-2 py-0.5 rounded bg-blue-600 text-white" on:click={copyRules}>{copied === ruleTool ? "已复制" : "复制"}</button>
+          </div>
+          <pre class="text-[11px] leading-snug max-h-40 overflow-auto rounded bg-white dark:bg-[#2c2c2e] p-2 select-text whitespace-pre">{rules[ruleTool]}</pre>
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            把三段分别粘到配置文件对应的小节里，规则要放在其他规则的最前面。LIVE 自己连腾讯时会绕开虚拟网卡直连，不会被规则绕回来。
+          </p>
+        {/if}
+      {/if}
       {#if finishedWithoutResult}
         <p class="text-xs text-amber-600 dark:text-amber-400">
           这次没有抓到直播地址。请确认是在抓取开始后才进入直播间；如果已在直播间，退出后重新进入再试。
@@ -294,7 +369,7 @@
       {/if}
       <div class="flex gap-2">
         <button class="px-3 py-1.5 text-xs rounded-md bg-blue-600 text-white disabled:opacity-50" disabled={busy}
-          on:click={() => run("wechat_capture_start")}>开始抓取</button>
+          on:click={() => run("wechat_capture_start", { mode: captureMode })}>开始抓取</button>
         <button class="px-3 py-1.5 text-xs rounded-md text-gray-600 dark:text-gray-400 hover:underline disabled:opacity-50" disabled={busy}
           on:click={() => run("wechat_capture_remove_ca")}>移除证书</button>
       </div>
@@ -302,6 +377,11 @@
       <p class="text-xs">
         抓取中（剩余 {clock(status.remaining_secs)}）。现在到<strong>电脑版微信</strong>打开要录的视频号直播；如果已经在直播间，请退出后重新进入。
       </p>
+      {#if status.mode === "rules"}
+        <p class="text-xs text-gray-500 dark:text-gray-400">
+          分流规则模式，监听 127.0.0.1:{status.rules_port}{#if status.bypass_interface}，经 {status.bypass_interface} 绕开虚拟网卡直连{/if}。没有出现地址时，先确认代理工具里的规则已生效且排在最前。
+        </p>
+      {/if}
       {#if status.replaced_existing_proxy}
         <p class="text-xs text-amber-600 dark:text-amber-400">你原来开着系统代理，抓取期间其他软件不会经过它，结束后自动恢复。</p>
       {/if}
