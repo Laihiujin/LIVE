@@ -6,16 +6,33 @@
   let showDonateModal = false;
   let releases = [];
 
+  // "v1.2.3" -> [1, 2, 3]; anything else -> null
+  function parseVersion(tag) {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(tag ?? "");
+    return match ? match.slice(1).map(Number) : null;
+  }
+
+  function isNewerVersion(candidate, current) {
+    const a = parseVersion(candidate);
+    const b = parseVersion(current);
+    if (!a || !b) return false;
+    for (let i = 0; i < 3; i++) {
+      if (a[i] !== b[i]) return a[i] > b[i];
+    }
+    return false;
+  }
+
   // get releases from github api
   fetch("https://api.github.com/repos/laihiujin/LIVE/releases")
     .then((response) => response.json())
     .then((data) => {
+      if (!Array.isArray(data)) return;
       // Filter out prerelease versions
       const stableReleases = data.filter((release) => !release.prerelease);
       const latest = stableReleases[0]?.tag_name;
       latestVersion.set(latest);
-      // Compare versions and set hasNewVersion
-      if (version && latest !== version) {
+      // Only flag an update when GitHub has a strictly newer release
+      if (isNewerVersion(latest, version)) {
         hasNewVersion.set(true);
       }
       releases = stableReleases.slice(0, 3).map((release) => ({

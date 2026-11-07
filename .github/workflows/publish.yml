@@ -1,5 +1,9 @@
 name: Publish
 
+# 发版：改 package.json 和 src-tauri/Cargo.toml 的 version，合入 main 后推送 tag `v<version>`。
+# 手动运行（workflow_dispatch）时，tag 由 package.json 的版本推出，不再用分支名当 tag。
+# 产物统一命名为 LIVE_<version>_<系统>-<架构>[-变体].<扩展名>，先进入草稿 release，核对后手动发布。
+
 on:
   workflow_dispatch:
   push:
@@ -14,8 +18,58 @@ concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  GH_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
 jobs:
-  publish-tauri:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        id: version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::package.json ($version) 和 src-tauri/Cargo.toml ($cargo_version) 的版本不一致"
+            exit 1
+          fi
+          tag="v$version"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $version 不一致，应为 $tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag"
+
+      - name: Create draft release
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::$TAG 已正式发布，不会覆盖它的安装包；请先提升版本号"
+              exit 1
+            fi
+            echo "Draft release $TAG already exists; its assets will be replaced."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --target "$GITHUB_SHA" --title "LIVE $TAG" --generate-notes
+          fi
+
+  publish-unix:
+    needs: prepare-release
     strategy:
       fail-fast: false
       matrix:
@@ -25,42 +79,28 @@ jobs:
             args: "--target aarch64-apple-darwin --bundles app"
             rust-target: aarch64-apple-darwin
             label: macos-arm64
-            tauri-config: ""
-            include-updater-json: false
-
           # macOS x86_64 (Intel)
           - platform: macos-15-intel
             args: "--target x86_64-apple-darwin --bundles app"
             rust-target: x86_64-apple-darwin
             label: macos-x64
-            tauri-config: ""
-            include-updater-json: false
-
-          # Ubuntu
+          # Linux x86_64
           - platform: ubuntu-22.04
             args: ""
             rust-target: ""
             label: linux-x64
-            tauri-config: ""
-            include-updater-json: true
 
     runs-on: ${{ matrix.platform }}
     name: Publish (${{ matrix.label }})
+    env:
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+      TAG: ${{ needs.prepare-release.outputs.tag }}
 
     steps:
-      # ✅ 关键修复：fetch-depth: 0 确保拉取完整 git 历史和所有 tag
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      # 调试用：确认 tag 和 remote 正确
-      - name: Debug git info
-        shell: bash
-        run: |
-          git describe --tags --always
-          git remote -v
-          echo "Current tag: ${GITHUB_REF#refs/tags/}"
 
       # ---------- Node.js ----------
       - name: Setup Node.js
@@ -86,9 +126,9 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
-      # ---------- Linux 系统依赖 ----------
+      # ---------- Linux ----------
       - name: Install Linux system dependencies
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.label, 'linux-')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -107,58 +147,16 @@ jobs:
             clang \
             llvm
 
-      # ---------- macOS 依赖 ----------
+      - name: Build Linux packages
+        if: startsWith(matrix.label, 'linux-')
+        run: yarn tauri build
+
+      # ---------- macOS ----------
       - name: Install macOS dependencies (cmake/llvm for whisper-rs)
-        if: startsWith(matrix.platform, 'macos-')
+        if: startsWith(matrix.label, 'macos-')
         run: |
           brew install cmake llvm
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-
-      # ---------- Windows 依赖 ----------
-      - name: Install Windows dependencies (cmake/llvm for whisper-rs)
-        if: matrix.platform == 'windows-latest'
-        run: |
-          choco install cmake llvm -y --no-progress
-          printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
-          printf '%s\n' 'C:\Program Files\CMake\bin' >> "$GITHUB_PATH"
-        shell: bash
-
-      # ---------- Windows CUDA Toolkit ----------
-      - name: Install CUDA Toolkit (Windows CUDA only)
-        if: matrix.platform == 'windows-latest' && contains(matrix.args, 'cuda')
-        uses: Jimver/cuda-toolkit@v0.2.24
-        with:
-          cuda: "12.8.0"
-          method: network
-          sub-packages: '["nvcc", "cudart"]'
-
-      # ---------- 构建 & 发布 ----------
-      - name: Build and publish Tauri app
-        if: ${{ !startsWith(matrix.label, 'macos-') }}
-        uses: tauri-apps/tauri-action@v0
-        env:
-          # If RELEASE_TOKEN exists (PAT with repo scope), prefer it.
-          # Fallback to the default GITHUB_TOKEN.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # CUDA 环境变量（仅 Windows CUDA 生效）
-          CUDA_PATH: ${{ matrix.platform == 'windows-latest' && contains(matrix.args, 'cuda') && env.CUDA_PATH || '' }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "LIVE ${{ github.ref_name }}"
-          releaseBody: |
-            ## LIVE ${{ github.ref_name }}
-
-            See the [CHANGELOG](https://github.com/${{ github.repository }}/releases) for more details.
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: ${{ matrix.include-updater-json }}
-          args: ${{ matrix.args }} ${{ matrix.tauri-config }}
 
       - name: Build macOS app bundle
         if: startsWith(matrix.label, 'macos-')
@@ -171,59 +169,66 @@ jobs:
         run: |
           LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export LIBCLANG_PATH
-          cmd=(yarn tauri build)
-          if [ -n "${{ matrix.args }}" ]; then
-            read -r -a build_args <<< "${{ matrix.args }}"
-            cmd+=("${build_args[@]}")
-          fi
-          if [ -n "${{ matrix.tauri-config }}" ]; then
-            read -r -a config_args <<< "${{ matrix.tauri-config }}"
-            cmd+=("${config_args[@]}")
-          fi
-          "${cmd[@]}"
+          read -r -a build_args <<< "${{ matrix.args }}"
+          yarn tauri build "${build_args[@]}"
 
       - name: Package macOS DMG
         if: startsWith(matrix.label, 'macos-')
         run: bash ./scripts/package-macos-dmg.sh ${{ matrix.rust-target }}
 
-      - name: Upload macOS DMG to release
-        if: startsWith(matrix.label, 'macos-')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: LIVE ${{ github.ref_name }}
-          draft: true
-          prerelease: false
-          files: src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+      # ---------- 统一命名并上传 ----------
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          out=release-assets
+          mkdir -p "$out"
+          take() { # take <源文件> <目标文件名>
+            [ -f "$1" ] || { echo "::error::找不到 $1"; exit 1; }
+            cp "$1" "$out/$2"
+          }
+          case "${{ matrix.label }}" in
+            macos-arm64)
+              take "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/LIVE_${VERSION}_aarch64.dmg" "LIVE_${VERSION}_macos-arm64.dmg" ;;
+            macos-x64)
+              take "src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/LIVE_${VERSION}_x86_64.dmg" "LIVE_${VERSION}_macos-x64.dmg" ;;
+            linux-x64)
+              bundle=src-tauri/target/release/bundle
+              for pair in "appimage/*.AppImage:AppImage" "deb/*.deb:deb" "rpm/*.rpm:rpm"; do
+                pattern="${pair%%:*}"; ext="${pair##*:}"
+                files=($bundle/$pattern)
+                [ "${#files[@]}" -eq 1 ] || { echo "::error::$bundle/$pattern 应恰好有 1 个文件，实际 ${#files[@]} 个"; exit 1; }
+                cp "${files[0]}" "$out/LIVE_${VERSION}_linux-x64.$ext"
+              done ;;
+          esac
+          ls -l "$out"
 
-      - name: Upload macOS DMG artifact
-        if: startsWith(matrix.label, 'macos-')
+      - name: Upload assets to draft release
+        shell: bash
+        run: gh release upload "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LIVE-${{ matrix.label }}-dmg
-          path: src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
+          name: LIVE_${{ env.VERSION }}_${{ matrix.label }}
+          path: release-assets/*
+          compression-level: 0
           if-no-files-found: error
 
   publish-windows:
+    needs: prepare-release
     runs-on: windows-2022
-    name: Publish (windows-packages)
-    permissions:
-      contents: write
+    name: Publish (windows-x64)
+    env:
+      VERSION: ${{ needs.prepare-release.outputs.version }}
+      TAG: ${{ needs.prepare-release.outputs.tag }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Debug git info
-        shell: bash
-        run: |
-          git describe --tags --always
-          git remote -v
-          echo "Current tag: ${GITHUB_REF#refs/tags/}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -273,19 +278,6 @@ jobs:
           REQUIRE_CUDA_BUILD: "1"
         run: .\build.ps1
 
-      - name: Upload Windows packages to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: LIVE ${{ github.ref_name }}
-          draft: true
-          prerelease: false
-          files: |
-            src-tauri/target/LIVE-cpu_*_x64-setup.exe
-            src-tauri/target/LIVE-cuda_*_x64-setup.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-
       - name: Report package sizes
         shell: powershell
         run: |
@@ -298,18 +290,32 @@ jobs:
             Sort-Object Length -Descending |
             ForEach-Object { '{0,9:N1} MiB  {1}' -f ($_.Length / 1MB), $_.Name }
 
-      - name: Upload CPU installer
+      # build.ps1 产出 LIVE-cpu_<v>_x64-setup.exe / LIVE-cuda_<v>_x64-setup.exe，这里改成统一命名
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "src-tauri/target/LIVE-cpu_${VERSION}_x64-setup.exe" "release-assets/LIVE_${VERSION}_windows-x64-setup.exe"
+          cp "src-tauri/target/LIVE-cuda_${VERSION}_x64-setup.exe" "release-assets/LIVE_${VERSION}_windows-x64-cuda-setup.exe"
+          ls -l release-assets
+
+      - name: Upload assets to draft release
+        shell: bash
+        run: gh release upload "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Upload CPU installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LIVE-windows-cpu
-          path: src-tauri/target/LIVE-cpu_*_x64-setup.exe
+          name: LIVE_${{ env.VERSION }}_windows-x64
+          path: release-assets/LIVE_${{ env.VERSION }}_windows-x64-setup.exe
           compression-level: 0
           if-no-files-found: error
 
-      - name: Upload CUDA installer
+      - name: Upload CUDA installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LIVE-windows-cuda
-          path: src-tauri/target/LIVE-cuda_*_x64-setup.exe
+          name: LIVE_${{ env.VERSION }}_windows-x64-cuda
+          path: release-assets/LIVE_${{ env.VERSION }}_windows-x64-cuda-setup.exe
           compression-level: 0
           if-no-files-found: error

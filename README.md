@@ -60,13 +60,15 @@
 
 ## 安装
 
-前往 [Releases](../../releases) 下载对应平台的安装包。
+前往 [Releases](../../releases) 下载对应平台的安装包。版本号从 v1.0.0 开始，文件统一命名为 `LIVE_<版本>_<系统>-<架构>`：
 
 | 文件 | 说明 |
 |---|---|
-| `LIVE_x.y.z_x64-setup.exe` | Windows |
-| `LIVE_x.y.z_aarch64.dmg` | macOS Apple Silicon |
-| `LIVE_x.y.z_x86_64.dmg` | macOS Intel |
+| `LIVE_x.y.z_windows-x64-setup.exe` | Windows |
+| `LIVE_x.y.z_windows-x64-cuda-setup.exe` | Windows，NVIDIA 显卡加速字幕识别（CUDA） |
+| `LIVE_x.y.z_macos-arm64.dmg` | macOS Apple Silicon（M 系列芯片） |
+| `LIVE_x.y.z_macos-x64.dmg` | macOS Intel |
+| `LIVE_x.y.z_linux-x64.AppImage` / `.deb` / `.rpm` | Linux |
 
 ## 致谢
 
