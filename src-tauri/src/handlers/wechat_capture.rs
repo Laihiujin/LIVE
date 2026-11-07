@@ -1,5 +1,6 @@
 //! Commands for the opt-in video-channel stream capture. See `recorder::platforms::wechat::capture`.
-use recorder::platforms::wechat::capture::{CaptureStatus, WechatCapture};
+use recorder::platforms::wechat::bypass::RuleSnippets;
+use recorder::platforms::wechat::capture::{CaptureMode, CaptureStatus, WechatCapture};
 use std::sync::Arc;
 
 type CaptureState<'a> = tauri::State<'a, Arc<WechatCapture>>;
@@ -20,8 +21,19 @@ pub async fn wechat_capture_remove_ca(capture: CaptureState<'_>) -> Result<(), S
 }
 
 #[tauri::command]
-pub async fn wechat_capture_start(capture: CaptureState<'_>) -> Result<(), String> {
-    capture.start().await
+pub async fn wechat_capture_start(
+    capture: CaptureState<'_>,
+    mode: Option<CaptureMode>,
+) -> Result<(), String> {
+    capture
+        .start_with(mode.unwrap_or(CaptureMode::SystemProxy))
+        .await
+}
+
+/// Rules for Quantumult X, Shadowrocket and Clash that forward the capture domains to LIVE.
+#[tauri::command]
+pub async fn wechat_capture_rules(capture: CaptureState<'_>) -> Result<RuleSnippets, String> {
+    Ok(capture.rule_snippets())
 }
 
 #[tauri::command]

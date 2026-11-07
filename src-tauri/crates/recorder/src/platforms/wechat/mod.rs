@@ -1,4 +1,5 @@
 //! Video-channel media import adapter, independent of WeChat installation/certificates.
+pub mod bypass;
 pub mod capture;
 pub mod source;
 
